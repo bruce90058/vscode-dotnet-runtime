@@ -130,7 +130,7 @@ export async function getDistroInfo(context: IAcquisitionWorkerContext): Promise
     {
         return { distro: '', version: '' };
     }
-    return new LinuxVersionResolver(context, getMockUtilityContext()).getRunningDistro();
+    return new LinuxVersionResolver(context, getMockUtilityContext()).getRunningDistroInstance();
 }
 
 /**
@@ -174,5 +174,5 @@ export async function getLinuxSupportedDotnetSDKVersion(context: IAcquisitionWor
 
 export function getLatestLinuxDotnet()
 {
-    return '10.0.100';
+    return '11.0.100';
 }

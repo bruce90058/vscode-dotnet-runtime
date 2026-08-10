@@ -4,7 +4,7 @@
 *--------------------------------------------------------------------------------------------*/
 import * as fs from 'fs';
 import * as path from 'path';
-import { DotnetInstall, InstallToStrings } from '../Acquisition/DotnetInstall';
+import type { DotnetInstall } from '../Acquisition/DotnetInstall';
 import { DotnetInstallMode } from '../Acquisition/DotnetInstallMode';
 import { IDotnetInstallationContext } from '../Acquisition/IDotnetInstallationContext';
 import { DotnetInstallType } from '../IDotnetAcquireContext';
@@ -12,6 +12,17 @@ import { IDotnetFindPathContext } from '../IDotnetFindPathContext';
 import { EventType } from './EventType';
 import { IEvent } from './IEvent';
 import { TelemetryUtilities } from './TelemetryUtilities';
+
+function InstallToStrings(install: DotnetInstall)
+{
+    return {
+        installId: install.installId,
+        version: install.version,
+        architecture: install.architecture ?? 'unspecified',
+        isGlobal: install.isGlobal.toString(),
+        installMode: install.installMode.toString()
+    };
+}
 
 export class EventCancellationError extends Error
 {
@@ -306,8 +317,7 @@ export class DotnetAcquisitionFinalError extends GenericModalEvent
  * This allows us to count all errors and analyze them into categories.
  * The event name for the failure cause is stored in the originalEventName property.
  */
-abstract class DotnetAcquisitionFinalErrorBase extends DotnetAcquisitionError
-{
+abstract class DotnetAcquisitionFinalErrorBase extends DotnetAcquisitionError{
 
     constructor(public readonly error: Error, public readonly originalEventName: string, public readonly install: DotnetInstall)
     {
@@ -344,6 +354,29 @@ export class DotnetASPNetRuntimeFinalAcquisitionError extends DotnetAcquisitionF
 {
     public eventName = 'DotnetASPNetRuntimeFinalAcquisitionError';
     public verboseOutputOnly = true;
+}
+
+/**
+ * @remarks Terminal error for an uninstall command. Distinct from DotnetAcquisitionFinalError so that a failure to
+ * REMOVE .NET is not mis-reported (in telemetry and the output channel) as a failure to ACQUIRE/install .NET.
+ */
+export class DotnetUninstallFinalError extends DotnetAcquisitionError
+{
+    public readonly type = EventType.DotnetUninstallFinalError;
+    public readonly eventName = 'DotnetUninstallFinalError';
+
+    constructor(error: Error, public readonly originalEventName: string, install: DotnetInstall)
+    {
+        super(error, install);
+    }
+
+    public getProperties(telemetry = false): { [id: string]: string } | undefined
+    {
+        return {
+            FailureMode: this.originalEventName,
+            ...super.getProperties(telemetry)
+        };
+    }
 }
 
 export abstract class DotnetNonAcquisitionError extends IEvent
@@ -625,7 +658,10 @@ export class DotnetInstallCancelledByUserError extends DotnetInstallExpectedAbor
     public readonly eventName = 'DotnetInstallCancelledByUserError';
 }
 
-
+export class DotnetUninstallCancelledByUserError extends DotnetInstallExpectedAbort
+{
+    public readonly eventName = 'DotnetUninstallCancelledByUserError';
+}
 
 export class DotnetNonZeroInstallerExitCodeError extends DotnetAcquisitionError
 {
@@ -1054,13 +1090,13 @@ export class DotnetUninstallStarted extends DotnetCustomMessageEvent
 
 export class DotnetUninstallCompleted extends DotnetCustomMessageEvent
 {
-    public readonly eventName = 'DotnetUninstallStarted';
+    public readonly eventName = 'DotnetUninstallCompleted';
     public type = EventType.DotnetUninstallMessage;
 }
 
 export class DotnetUninstallFailed extends DotnetCustomMessageEvent
 {
-    public readonly eventName = 'DotnetUninstallStarted';
+    public readonly eventName = 'DotnetUninstallFailed';
     public type = EventType.DotnetUninstallMessage;
 }
 
@@ -1505,6 +1541,11 @@ export class AutomaticUpdateCheck extends DotnetCustomMessageEvent
 export class UpdatingInstallGroups extends DotnetCustomMessageEvent
 {
     public readonly eventName = 'UpdatingInstallGroups';
+}
+
+export class SkippingIncompatibleArchitectureInstall extends DotnetCustomMessageEvent
+{
+    public readonly eventName = 'SkippingIncompatibleArchitectureInstall';
 }
 
 export class NoMatchingInstallToStopTracking extends DotnetCustomMessageEvent
@@ -1997,6 +2038,76 @@ export class TestAcquireCalled extends IEvent
     public getProperties()
     {
         return undefined;
+    }
+}
+
+/**
+ * Event for when a Language Model Tool is invoked by an AI agent.
+ * This provides visibility into AI tool usage in the logs.
+ */
+export class LanguageModelToolInvoked extends DotnetAcquisitionMessage
+{
+    public readonly eventName = 'LanguageModelToolInvoked';
+
+    constructor(public readonly toolName: string, public readonly input: string)
+    {
+        super();
+    }
+
+    public getProperties(telemetry = false): { [id: string]: string } | undefined
+    {
+        return {
+            ToolName: this.toolName,
+            // Don't include full input in telemetry to avoid PII, but include in local logs
+            Input: telemetry ? 'Redacted' : this.input
+        };
+    }
+}
+
+/**
+ * Event for when a Language Model Tool prepares for invocation.
+ */
+export class LanguageModelToolPrepareInvocation extends DotnetAcquisitionMessage
+{
+    public readonly eventName = 'LanguageModelToolPrepareInvocation';
+
+    constructor(public readonly toolName: string, public readonly input: string)
+    {
+        super();
+    }
+
+    public getProperties(telemetry = false): { [id: string]: string } | undefined
+    {
+        return {
+            ToolName: this.toolName,
+            Input: telemetry ? 'Redacted' : this.input
+        };
+    }
+}
+
+/**
+ * Event for when Language Model Tools registration fails.
+ * This is a non-fatal error - the extension continues to work without AI tool integration.
+ */
+export class LanguageModelToolsRegistrationError extends DotnetNonAcquisitionError
+{
+    public readonly eventName = 'LanguageModelToolsRegistrationError';
+
+    constructor(error: Error)
+    {
+        super(error);
+    }
+
+    public getProperties(telemetry = false): { [id: string]: string } | undefined
+    {
+        // Only capture error name and a sanitized message - avoid PII like paths
+        return {
+            ErrorName: this.error.name ?? 'UnknownError',
+            // Only capture error code if present, not the full message which might contain paths
+            ErrorCode: (this.error as NodeJS.ErrnoException).code ?? 'NoCode',
+            // Use hashed stack trace to avoid path PII
+            StackTrace: this.error.stack ? TelemetryUtilities.HashAllPaths(this.error.stack) : ''
+        };
     }
 }
 

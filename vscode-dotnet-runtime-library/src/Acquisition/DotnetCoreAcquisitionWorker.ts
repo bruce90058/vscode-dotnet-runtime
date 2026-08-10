@@ -5,8 +5,6 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import rimraf = require('rimraf');
-import { promisify } from 'util';
 
 import
 {
@@ -44,6 +42,7 @@ import { TelemetryUtilities } from '../EventStream/TelemetryUtilities';
 import { IDotnetAcquireResult } from '../IDotnetAcquireResult';
 import { IExtensionState } from '../IExtensionState';
 import { IVSCodeExtensionContext } from '../IVSCodeExtensionContext';
+import { LocalMemoryCacheSingleton } from '../LocalMemoryCacheSingleton';
 import { CommandExecutor } from '../Utils/CommandExecutor';
 import { FileUtilities } from '../Utils/FileUtilities';
 import { IFileUtilities } from '../Utils/IFileUtilities';
@@ -52,8 +51,8 @@ import { IUtilityContext } from '../Utils/IUtilityContext';
 import { executeWithLock, getDotnetExecutable, isRunningUnderWSL } from '../Utils/TypescriptUtilities';
 import { DOTNET_INFORMATION_CACHE_DURATION_MS, GLOBAL_LOCK_PING_DURATION_MS, LOCAL_LOCK_PING_DURATION_MS } from './CacheTimeConstants';
 import { directoryProviderFactory } from './DirectoryProviderFactory';
-import { LocalMemoryCacheSingleton } from '../LocalMemoryCacheSingleton';
 import { DotnetConditionValidator } from './DotnetConditionValidator';
+import { getDefaultArchitecture } from './ArchitectureUtilities';
 import
 {
     DotnetInstall,
@@ -387,12 +386,12 @@ export class DotnetCoreAcquisitionWorker implements IDotnetCoreAcquisitionWorker
         {
             return 'null';
         }
-        return DotnetCoreAcquisitionWorker.defaultArchitecture();
+        return getDefaultArchitecture();
     }
 
     public static defaultArchitecture(): string
     {
-        return os.arch();
+        return getDefaultArchitecture();
     }
 
     private getErrorOrStringAsEventError(error: any)
@@ -417,7 +416,7 @@ export class DotnetCoreAcquisitionWorker implements IDotnetCoreAcquisitionWorker
 
     private async acquireGlobalCore(context: IAcquisitionWorkerContext, globalInstallerResolver: GlobalInstallerResolver, install: DotnetInstall): Promise<string>
     {
-        if (await isRunningUnderWSL(context, this.utilityContext))
+        if (await isRunningUnderWSL(context.eventStream))
         {
             const err = new DotnetWSLSecurityError(new EventCancellationError('DotnetWSLSecurityError',
                 `Automatic .NET SDK Installation is not yet supported in WSL due to VS Code & WSL limitations.
@@ -440,7 +439,9 @@ export class DotnetCoreAcquisitionWorker implements IDotnetCoreAcquisitionWorker
         if (process.env.VSCODE_DOTNET_GLOBAL_INSTALL_FAKE_PATH && process.env.VSCODE_DOTNET_GLOBAL_INSTALL_FAKE_PATH === 'true')
         {
             context.eventStream.post(new DotnetFakeSDKEnvironmentVariableTriggered(`VSCODE_DOTNET_GLOBAL_INSTALL_FAKE_PATH has been set.`));
-            return 'fake-sdk';
+            // Return a realistic executable file path (directory + host executable) so callers that derive the
+            // install directory via path.dirname(...) (e.g. setPathEnvVar) behave as they would for a real install.
+            return path.join('fake-sdk', getDotnetExecutable());
         }
 
         let dotnetExePath: string = await installer.getExpectedGlobalSDKPath(installingVersion,
@@ -602,34 +603,57 @@ Other dependents remain.`));
             install), GLOBAL_LOCK_PING_DURATION_MS, context.timeoutSeconds * 1000,
             async () =>
             {
+                // Only system-wide SDKs can be uninstalled through this path: the global installer/resolver stack is
+                // SDK-only (a runtime/aspnetcore version has no feature band, so GlobalInstallerResolver would crash
+                // while computing one). System-wide runtimes are owned by the OS package manager / installer, not this
+                // extension. Reject early with an honest error instead of surfacing a confusing feature-band failure.
+                if (install.installMode !== 'sdk')
+                {
+                    const unsupportedGlobalRuntimeError = new EventBasedError('UnsupportedGlobalRuntimeUninstall',
+                        `Cannot uninstall a system-wide .NET ${install.installMode} (${install.version}) through this extension. ` +
+                        `System-wide ${install.installMode} installs are managed by your OS package manager or the installer they came from; remove it there instead. ` +
+                        `This extension only uninstalls system-wide SDKs and VS Code-managed (local) runtimes.`);
+                    context.eventStream.post(new DotnetUninstallFailed(unsupportedGlobalRuntimeError.message));
+                    throw unsupportedGlobalRuntimeError;
+                }
+
                 let systemInstallPath = '';
+                let uninstallResult = '';
 
                 try
                 {
-                    context.eventStream.post(new DotnetUninstallStarted(`Attempting to remove .NET ${install.installId}.`));
                     await InstallTrackerSingleton.getInstance(context.eventStream, context.extensionState).untrackInstalledVersion(context, install, force);
 
                     // Note: it's ok not to check live dependents here (though we could) since this will require UAC and extensions do not depend on us to auto-manage admin installs
-                    if (force || await InstallTrackerSingleton.getInstance(context.eventStream, context.extensionState).installHasNoRegisteredDependentsBesidesId(install, context.installDirectoryProvider, false, context.acquisitionContext.requestingExtensionId ?? ''))
+                    if (!force && !(await InstallTrackerSingleton.getInstance(context.eventStream, context.extensionState).installHasNoRegisteredDependentsBesidesId(install, context.installDirectoryProvider, false, context.acquisitionContext.requestingExtensionId ?? '')))
                     {
-                        const installingVersion = await globalInstallerResolver.getFullySpecifiedVersion();
-                        const installer: IGlobalInstaller = os.platform() === 'linux' ?
-                            new LinuxGlobalInstaller(context, this.utilityContext, installingVersion) :
-                            new WinMacGlobalInstaller(context, this.utilityContext, installingVersion, await globalInstallerResolver.getInstallerUrl(), await globalInstallerResolver.getInstallerHash());
-
-                        systemInstallPath = await installer.getExpectedGlobalSDKPath(installingVersion, install.architecture);
-                        const ok = await installer.uninstallSDK(install);
-                        LocalMemoryCacheSingleton.getInstance().invalidateEntriesContaining('dotnet', context);
-                        await new CommandExecutor(context, this.utilityContext).endSudoProcessMaster(context.eventStream);
-                        if (ok === '0')
-                        {
-                            await InstallTrackerSingleton.getInstance(context.eventStream, context.extensionState).reportSuccessfulUninstall(context, install, force);
-                            context.eventStream.post(new DotnetUninstallCompleted(`Uninstalled .NET ${install.installId}.`));
-                            return '0';
-                        }
+                        context.eventStream.post(new DotnetUninstallSkipped(`Removed reference of ${JSON.stringify(install)}, but did not uninstall .NET ${install.installId}.
+Other dependents remain.`));
+                        return '0';
                     }
-                    context.eventStream.post(new DotnetUninstallFailed(`Failed to uninstall .NET ${install.installId}. Another install may be in progress? Uninstall manually or delete the folder.`));
-                    return '117778'; // arbitrary error code to indicate uninstall failed without error.
+
+                    context.eventStream.post(new DotnetUninstallStarted(`Attempting to remove .NET ${install.installId}.`));
+                    const installingVersion = await globalInstallerResolver.getFullySpecifiedVersion();
+                    const installer: IGlobalInstaller = os.platform() === 'linux' ?
+                        new LinuxGlobalInstaller(context, this.utilityContext, installingVersion) :
+                        new WinMacGlobalInstaller(context, this.utilityContext, installingVersion, await globalInstallerResolver.getInstallerUrl(), await globalInstallerResolver.getInstallerHash());
+
+                    systemInstallPath = await installer.getExpectedGlobalSDKPath(installingVersion, install.architecture);
+                    uninstallResult = await installer.uninstallSDK(install);
+                    LocalMemoryCacheSingleton.getInstance().invalidateEntriesContaining('dotnet', context);
+                    await new CommandExecutor(context, this.utilityContext).endSudoProcessMaster(context.eventStream);
+                    if (uninstallResult === '0')
+                    {
+                        await InstallTrackerSingleton.getInstance(context.eventStream, context.extensionState).reportSuccessfulUninstall(context, install, force);
+                        context.eventStream.post(new DotnetUninstallCompleted(`Uninstalled .NET ${install.installId}.`));
+                        return '0';
+                    }
+
+                    // When command execution is non-terminal, the status may contain a useful error from the elevation
+                    // provider (for example, "User did not grant permission.") instead of only a numeric exit code.
+                    const failureReason = uninstallResult.trim();
+                    context.eventStream.post(new DotnetUninstallFailed(`Failed to uninstall .NET ${install.installId}.${failureReason ? ` ${failureReason}` : ''}`));
+                    return failureReason || '1';
                 }
                 catch (error: any)
                 {
@@ -667,7 +691,7 @@ Other dependents remain.`));
                 }
                 try
                 {
-                    await promisify(rimraf)(fullSubDirectoryPath);
+                    await fs.promises.rm(fullSubDirectoryPath, { recursive: true, force: true });
                     eventStream.post(new DotnetAcquisitionDeletion(`Deleted .NET folder ${folderPath} when marked for deletion.`));
                 }
                 catch (error: any)

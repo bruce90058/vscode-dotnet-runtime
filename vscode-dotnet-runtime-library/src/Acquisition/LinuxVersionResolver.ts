@@ -20,50 +20,19 @@ import { FileUtilities } from '../Utils/FileUtilities';
 import { ICommandExecutor } from '../Utils/ICommandExecutor';
 import { getInstallFromContext } from '../Utils/InstallIdUtilities';
 import { IUtilityContext } from '../Utils/IUtilityContext';
+import { getRunningDistro, microsoftSupportedDistroIds } from '../Utils/TypescriptUtilities';
 import { DebianDistroSDKProvider } from './DebianDistroSDKProvider';
+import { DistroVersionPair, DotnetDistroSupportStatus } from './DistroTypes';
 import { DotnetInstallMode } from './DotnetInstallMode';
 import { GenericDistroSDKProvider } from './GenericDistroSDKProvider';
 import { IAcquisitionWorkerContext } from './IAcquisitionWorkerContext';
 import { IDistroDotnetSDKProvider } from './IDistroDotnetSDKProvider';
 import { RedHatDistroSDKProvider } from './RedHatDistroSDKProvider';
-import { DEBIAN_DISTRO_INFO_KEY, RED_HAT_DISTRO_INFO_KEY, UBUNTU_DISTRO_INFO_KEY } from './StringConstants';
+import { DEBIAN_DISTRO_INFO_KEY, RED_HAT_DISTRO_INFO_KEY } from './StringConstants';
 import { VersionResolver } from './VersionResolver';
 import * as versionUtils from './VersionUtilities';
 
-
-/**
- * An enumeration type representing all distros with their versions that we recognize.
- * @remarks
- * Each . in a semver should be represented with _.
- * The string representation of the enum should contain exactly one space that separates the distro, then the version.
- */
-export interface DistroVersionPair
-{
-    distro: string,
-    version: string
-}
-
-/**
- * @remarks
- * Distro support means that the distro provides a dotnet sdk package by default without intervention.
- *
- * Microsoft support means that Microsoft provides packages for the distro but it's not in the distro maintained feed.
- * For Microsoft support, we currently don't support installs of these feeds yet.
- *
- * Partial support does not have any change in behavior from unsupported currently and can mean whatever the distro maintainer wants.
- * But it generally means that the distro and microsoft both do not officially support that version of dotnet.
- *
- * Unknown is a placeholder for development testing and future potential implementation and should not be used by contributors.
- */
-export const enum DotnetDistroSupportStatus
-{
-    Unsupported = 'UNSUPPORTED',
-    Distro = 'DISTRO',
-    Microsoft = 'MICROSOFT',
-    Partial = 'PARTIAL',
-    Unknown = 'UNKNOWN'
-}
-
+export { DistroVersionPair, DotnetDistroSupportStatus } from './DistroTypes';
 
 /**
  * This class is responsible for detecting the distro and version of the Linux OS.
@@ -95,9 +64,6 @@ Follow the instructions here to download the .NET SDK: https://learn.microsoft.c
 Or, install Red Hat Enterprise Linux 8.0 or Red Hat Enterprise Linux 9.0 from https://access.redhat.com/downloads/;`
     protected acquireCtx: IDotnetAcquireContext | null | undefined;
 
-    // This includes all distros that we officially support for this tool as a company. If a distro is not in this list, it can still have community member support.
-    public microsoftSupportedDistroIds = [RED_HAT_DISTRO_INFO_KEY, UBUNTU_DISTRO_INFO_KEY];
-
     constructor(private readonly workerContext: IAcquisitionWorkerContext, private readonly utilityContext: IUtilityContext,
         executor: ICommandExecutor | null = null, distroProvider: IDistroDotnetSDKProvider | null = null)
     {
@@ -112,48 +78,20 @@ Or, install Red Hat Enterprise Linux 8.0 or Red Hat Enterprise Linux 9.0 from ht
     }
 
     /**
+     * Instance method that delegates to the static getRunningDistro, adding error events and caching.
      * @remarks relies on /etc/os-release currently. public for testing purposes.
-     * @returns The linux distro and version thats running this app. Should only ever be ran on linux.
+     * @returns The linux distro and version. Throws if it cannot be determined.
      */
-    public async getRunningDistro(): Promise<DistroVersionPair>
+    public async getRunningDistroInstance(): Promise<DistroVersionPair>
     {
         if (this.distro)
         {
             return this.distro;
         }
 
-        const mainOSDeclarationFile = `/etc/os-release`;
-        // Some distros may not include the os-release file specified by system d, https://0pointer.de/blog/projects/os-release and this is a recommended fallback https://man7.org/linux/man-pages/man5/os-release.5.html
-        const backupOSDeclarationFile = `/usr/lib/os-release`;
-        const osDeclarationFile = await new FileUtilities().exists(mainOSDeclarationFile) ? mainOSDeclarationFile : backupOSDeclarationFile;
+        const result = await getRunningDistro(this.workerContext.eventStream);
 
-        const distroNameKey = 'NAME';
-        const distroVersionKey = 'VERSION_ID';
-        try
-        {
-            const osInfo = (await new FileUtilities().read(osDeclarationFile)).split('\n');
-            // We need to remove the quotes from the KEY="VALUE"\n pairs returned by the command stdout, and then turn it into a dictionary. We can't use replaceAll for older browsers.
-            // Replace only replaces one quote, so we remove the 2nd one later.
-            const infoWithQuotesRemoved = osInfo.map(x => x.replace('"', ''));
-            const infoWithSeparatedKeyValues = infoWithQuotesRemoved.map(x => x.split('='));
-            const keyValueMap = Object.fromEntries(infoWithSeparatedKeyValues.map(x => [x[0], x[1]]));
-
-            // Remove the 2nd quotes.
-            const distroName: string = keyValueMap[distroNameKey]?.replace('"', '') ?? '';
-            const distroVersion: string = keyValueMap[distroVersionKey]?.replace('"', '') ?? '';
-
-            if (distroName === '' || distroVersion === '')
-            {
-                const error = new DotnetAcquisitionDistroUnknownError(new EventCancellationError('DotnetAcquisitionDistroUnknownError',
-                    this.baseUnsupportedDistroErrorMessage), getInstallFromContext(this.workerContext));
-                this.workerContext.eventStream.post(error);
-                throw error.error;
-            }
-
-            const pair: DistroVersionPair = { distro: distroName, version: distroVersion };
-            return pair;
-        }
-        catch (error)
+        if (!result || result.distro === '' || result.version === '')
         {
             const err = new DotnetAcquisitionDistroUnknownError(new EventCancellationError('DotnetAcquisitionDistroUnknownError',
                 `${this.baseUnsupportedDistroErrorMessage} ... does /etc/os-release or /usr/lib/os-release exist?`),
@@ -161,6 +99,9 @@ Or, install Red Hat Enterprise Linux 8.0 or Red Hat Enterprise Linux 9.0 from ht
             this.workerContext.eventStream.post(err);
             throw err.error;
         }
+
+        this.distro = result;
+        return this.distro;
     }
 
 
@@ -173,7 +114,7 @@ Or, install Red Hat Enterprise Linux 8.0 or Red Hat Enterprise Linux 9.0 from ht
     {
         if (!this.distro)
         {
-            this.distro = await this.getRunningDistro();
+            this.distro = await this.getRunningDistroInstance();
         }
 
         if (!this.distroSDKProvider)
@@ -192,7 +133,7 @@ Or, install Red Hat Enterprise Linux 8.0 or Red Hat Enterprise Linux 9.0 from ht
         }
         else
         {
-            if (!this.microsoftSupportedDistroIds.includes(this.distro.distro))
+            if (!microsoftSupportedDistroIds.includes(this.distro.distro))
             {
                 // UX: Could eventually add a 'Go away' button via the callback:
                 this.utilityContext.ui.showInformationMessage(`Automated SDK installation for the distro ${this.distro.distro} is not officially supported, except for community implemented and Microsoft approved support.
@@ -318,8 +259,10 @@ If you experience issues, please reach out on https://github.com/dotnet/vscode-d
             if (existingGlobalInstallSDKVersion && Number(versionUtils.getMajorMinor(existingGlobalInstallSDKVersion, this.workerContext.eventStream, this.workerContext)) ===
                 Number(versionUtils.getMajorMinor(fullySpecifiedDotnetVersion, this.workerContext.eventStream, this.workerContext)))
             {
-                const isPatchUpgrade = Number(versionUtils.getFeatureBandPatchVersion(existingGlobalInstallSDKVersion, this.workerContext.eventStream, this.workerContext)) <
-                    Number(versionUtils.getFeatureBandPatchVersion(fullySpecifiedDotnetVersion, this.workerContext.eventStream, this.workerContext));
+                // compareSDKPatchOrPreRelease is pre-release aware, so an existing pre-release SDK that is older than
+                // the requested one (e.g. installed 11.0.100-preview.5 vs requested 11.0.100-preview.6, which share a
+                // feature-band patch) is still recognized as an upgrade rather than an already-satisfied install.
+                const isPatchUpgrade = versionUtils.compareSDKPatchOrPreRelease(existingGlobalInstallSDKVersion, fullySpecifiedDotnetVersion, this.workerContext.eventStream, this.workerContext) < 0;
 
                 if (Number(versionUtils.getMajorMinor(existingGlobalInstallSDKVersion, this.workerContext.eventStream, this.workerContext)) >
                     Number(versionUtils.getMajorMinor(fullySpecifiedDotnetVersion, this.workerContext.eventStream, this.workerContext))
